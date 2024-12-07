@@ -9,7 +9,7 @@ contract TokenFactory {
         string memory symbol,
         uint256 totalSupply
     ) external returns (address) {
-        AuctionToken token = new AuctionToken(name, symbol, totalSupply);
+        AuctionToken token = new AuctionToken(name, symbol, totalSupply, msg.sender);
         return address(token);
     }
 }
@@ -18,8 +18,9 @@ contract AuctionToken is ERC20 {
     constructor(
         string memory name,
         string memory symbol,
-        uint256 totalSupply
+        uint256 totalSupply,
+        address owner
     ) ERC20(name, symbol) {
-        _mint(msg.sender, totalSupply);
+        _mint(owner, totalSupply);
     }
 } 
