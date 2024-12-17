@@ -19,7 +19,6 @@ import {
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import "./TokenFactory.sol";
-import "forge-std/console.sol";
 
 contract HookMonolith is BaseHook {
     using PoolIdLibrary for PoolKey;
@@ -35,29 +34,75 @@ contract HookMonolith is BaseHook {
         uint256 startTime;
         uint24 creatorFee;
         address token;
+        uint256 pricePerToken;
     }
 
     struct CallbackData {
-        // Minimal data needed initially, more info passed here now
         address creator;
         address token;
         uint256 totalSupply;
         uint256 allocation;
         uint24 creatorFee;
         int24 initialTick;
+        address referrer;
+        uint256 referrerAllocation;
+        uint256 pricePerToken;
     }
 
     TokenFactory public immutable tokenFactory;
     mapping(PoolId => AuctionConfig) public auctions;
     address public immutable USDT;
+    address public immutable owner;
     uint24 public constant PERIOD_ZERO_FEE = 3000; // 0.3%
     uint256 public constant COOLDOWN_PERIOD = 48 hours;
+    uint256 public constant AUCTION_CREATION_FEE = 10e18; // Fixed USDT fee for each auction
     IPoolManager public immutable manager;
+
+    uint24 public referrerFee; // Fee percentage for the referrer
+    mapping(address => uint256) public referralEarnings; // Tracks earnings for referrers
+
+    mapping(address => uint256) public paymentReceived; // Tracks payments received for each user
+    mapping(address => uint256) public referralPayments; // Tracks referral payments
+    uint256 public contractBalance; // Tracks the contract's balance
 
     constructor(IPoolManager _poolManager, address _USDT, address _tokenFactory) BaseHook(_poolManager) {
         USDT = _USDT;
         tokenFactory = TokenFactory(_tokenFactory);
         manager = _poolManager;
+        owner = msg.sender;
+    }
+
+    function withdrawPayments() external {
+        uint256 amount = paymentReceived[msg.sender];
+        require(amount > 0, "No payments to withdraw");
+    
+        paymentReceived[msg.sender] = 0;
+        require(IERC20(USDT).transfer(msg.sender, amount), "Withdrawal failed");
+    }
+    
+    function withdrawReferralPayments() external {
+        uint256 amount = referralPayments[msg.sender];
+        require(amount > 0, "No referral payments to withdraw");
+    
+        referralPayments[msg.sender] = 0;
+        require(IERC20(USDT).transfer(msg.sender, amount), "Withdrawal failed");
+    }
+    
+    function withdrawContractBalance() external {
+        require(msg.sender == owner, "Only owner can withdraw contract balance");
+        uint256 amount = contractBalance;
+        contractBalance = 0;
+        require(IERC20(USDT).transfer(owner, amount), "Withdrawal failed");
+    }
+
+    function setAuctionPrice(PoolId poolId, uint256 newPrice) external {
+        require(msg.sender == auctions[poolId].creator, "Only creator can set price");
+        auctions[poolId].pricePerToken = newPrice;
+    }
+
+    function setReferrerFee(uint24 _referrerFee) external {
+        require(_referrerFee <= 10000, "Fee must be <= 10000"); // Maximum is 100% (in basis points)
+        referrerFee = _referrerFee;
     }
 
     function initializeAuction(
@@ -66,22 +111,41 @@ contract HookMonolith is BaseHook {
         uint256 totalSupply,
         uint256 allocation,
         uint24 creatorFee,
-        int24 initialTick
+        int24 initialTick,
+        address referrer,
+        uint256 referrerAllocation,
+        uint256 pricePerToken
     ) external returns (address token) {
+        require(allocation > 0, "Allocation must be greater than 0");
+        require(creatorFee <= 10000, "Creator fee must be <= 10000");
+
+        require(IERC20(USDT).transferFrom(msg.sender, address(this), AUCTION_CREATION_FEE), "Fee transfer failed");
+        uint256 referrerPayment = 0;
+        if (referrer != address(0) && referrerFee > 0) {
+            referrerPayment = (AUCTION_CREATION_FEE * referrerFee) / 10000;
+            referralPayments[referrer] += referrerPayment;
+        }
+
+        uint256 ownerPayment = AUCTION_CREATION_FEE - referrerPayment;
+        paymentReceived[owner] += ownerPayment;
+
+
         token = tokenFactory.deployToken(name, symbol, totalSupply);
 
-        // We only call manager.unlock here and do all steps in _unlockCallback
-        bytes memory hookData = abi.encode(msg.sender, token, totalSupply, allocation, creatorFee, initialTick);
-
-        // Call unlock with just the callback data. We do not call modifyLiquidity here.
-        manager.unlock(abi.encode(CallbackData({
+        CallbackData memory cbData = CallbackData({
             creator: msg.sender,
             token: token,
             totalSupply: totalSupply,
             allocation: allocation,
             creatorFee: creatorFee,
-            initialTick: initialTick
-        })));
+            initialTick: initialTick,
+            referrer: referrer,
+            referrerAllocation: referrerAllocation,
+            pricePerToken: pricePerToken
+        });
+
+        // We only call manager.unlock here and do all steps in _unlockCallback
+        manager.unlock(abi.encode(cbData));
 
         return token;
     }
@@ -115,9 +179,6 @@ contract HookMonolith is BaseHook {
         uint160 sqrtPriceX96 = uint160(TickMath.getSqrtPriceAtTick(cbData.initialTick));
         manager.initialize(key, sqrtPriceX96);
 
-        // Here we provide on a range that's immediately below the initial tick or immediately above
-        // To ensure we only provide one token
-         // Dynamically set tick range based on token position
         int24 tickLower;
         int24 tickUpper;
         if (isToken0) {
@@ -128,7 +189,7 @@ contract HookMonolith is BaseHook {
             tickUpper = cbData.initialTick - key.tickSpacing;
         }
 
-        uint256 amountDesired = cbData.totalSupply - cbData.allocation;
+        uint256 amountDesired = cbData.totalSupply - cbData.allocation - cbData.referrerAllocation;
 
         // 1. Sync to ensure poolmanager sees updated balances
         manager.sync(isToken0 ? key.currency0 : key.currency1);
@@ -146,7 +207,6 @@ contract HookMonolith is BaseHook {
         uint160 sqrtLowerX96 = TickMath.getSqrtPriceAtTick(tickLower);
         uint160 sqrtUpperX96 = TickMath.getSqrtPriceAtTick(tickUpper);
 
-
         uint128 liquidityToAdd = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
             sqrtLowerX96,
@@ -155,7 +215,6 @@ contract HookMonolith is BaseHook {
             amount1Credit
         );
 
-        // 5. Now modify liquidity with the computed liquidity
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
             tickLower: tickLower,
             tickUpper: tickUpper,
@@ -163,7 +222,6 @@ contract HookMonolith is BaseHook {
             salt: bytes32(0)
         });
 
-        // Perform modifyLiquidity inside the callback
         (BalanceDelta delta,) = manager.modifyLiquidity(key, params, new bytes(0));
 
         // Store auction config
@@ -173,11 +231,17 @@ contract HookMonolith is BaseHook {
             allocation: cbData.allocation,
             startTime: block.timestamp,
             creatorFee: cbData.creatorFee,
-            token: cbData.token
+            token: cbData.token,
+            pricePerToken: cbData.pricePerToken
         });
 
         // Distribute creator allocation
         IERC20(cbData.token).transfer(cbData.creator, cbData.allocation);
+
+        // Distribute referrer allocation
+        if (cbData.referrer != address(0)) {
+            IERC20(cbData.token).transfer(cbData.referrer, cbData.referrerAllocation);
+        }
 
         return abi.encode(delta);
     }
@@ -227,7 +291,6 @@ contract HookMonolith is BaseHook {
             );
         }
 
-        // Return appropriate fee based on period
         uint24 fee = period == 0 ? PERIOD_ZERO_FEE : config.creatorFee;
         
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
@@ -251,7 +314,6 @@ contract HookMonolith is BaseHook {
     ) external override returns (bytes4) {
         PoolId poolId = key.toId();
         AuctionConfig memory config = auctions[poolId];
-
         require(
             getCurrentPeriod(config.startTime) == 1,
             "Liquidity locked in Period 0"

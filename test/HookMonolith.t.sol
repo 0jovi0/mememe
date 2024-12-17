@@ -47,20 +47,29 @@ contract HookMonolithTest is Test {
     function setUp() public {
         alice = makeAddr("alice");
         bob = makeAddr("bob");
-
+    
         usdt = new TestERC20(18);
         factory = new TokenFactory();
         poolManager = new PoolManager(makeAddr("poolManager"));
         hook = deployHookMonolith();
         swapRouter = new SwapRouter(poolManager);
-
-        // Deal initial balances
+    
+        // Deal initial ETH balances
         vm.deal(alice, ALICE_INITIAL_ETH);
         vm.deal(bob, BOB_INITIAL_ETH);
-
-        // Mint USDT
+    
+        // Mint USDT for Alice and Bob
         usdt.mint(alice, USDT_MINT_AMOUNT);
         usdt.mint(bob, USDT_MINT_AMOUNT);
+    
+        // Approve HookMonolith to pull USDT for auction fees
+        vm.startPrank(alice);
+        usdt.approve(address(hook), 1_000_000e18); // Large allowance for simplicity
+        vm.stopPrank();
+    
+        vm.startPrank(bob);
+        usdt.approve(address(hook), 1_000_000e18);
+        vm.stopPrank();
     }
 
     function deployHookMonolith() internal returns (HookMonolith) {
@@ -93,7 +102,18 @@ contract HookMonolithTest is Test {
         int24 initialTick,
         bool forceInverted
     ) internal returns (address, PoolId) {
-        address token = hook.initializeAuction(name, symbol, totalSupply, allocation, creatorFee, initialTick);
+        // Use dummy values for referrer (0x0), referrerAllocation (0), and pricePerToken (1e18)
+        address token = hook.initializeAuction(
+            name,
+            symbol,
+            totalSupply,
+            allocation,
+            creatorFee,
+            initialTick,
+            address(0),     // referrer
+            0,              // referrerAllocation
+            1e18            // pricePerToken
+        );
         PoolKey memory key = createPoolKey(token, forceInverted);
         return (token, key.toId());
     }
@@ -116,7 +136,14 @@ contract HookMonolithTest is Test {
         uint24 expectedCreatorFee,
         address expectedToken
     ) internal {
-        (address creator, uint256 allocation,, uint24 creatorFee, address token) = hook.auctions(poolId);
+        (
+            address creator,
+            uint256 allocation,
+            ,
+            uint24 creatorFee,
+            address token,
+            
+        ) = hook.auctions(poolId);
         assertEq(creator, expectedCreator, "creator mismatch");
         assertEq(allocation, expectedAllocation, "allocation mismatch");
         assertEq(creatorFee, expectedCreatorFee, "creatorFee mismatch");
@@ -146,7 +173,7 @@ contract HookMonolithTest is Test {
             true
         );
         assertAuctionDetails(auctionPoolId, alice, 100_000e18, 500, auctionToken);
-        assertTokenDistribution(auctionToken, alice, 100_000e18, address(poolManager), 900_000e18);
+        assertTokenDistribution(auctionToken, address(alice), 100_000e18, address(poolManager), 900_000e18);
     }
 
     function testPeriodTransition() public {
@@ -160,7 +187,7 @@ contract HookMonolithTest is Test {
             0,
             true
         );
-        (, , uint256 startTime,,) = hook.auctions(auctionPoolId);
+        (,,uint256 startTime,,,) = hook.auctions(auctionPoolId);
 
         assertEq(hook.getCurrentPeriod(startTime), 0);
         vm.warp(block.timestamp + 48 hours + 1);
@@ -168,6 +195,7 @@ contract HookMonolithTest is Test {
     }
 
     function testLiquidityDistribution() public {
+        vm.prank(alice);
         (auctionToken, auctionPoolId) = initializeAuctionHelper(
             "Test Token",
             "TEST",
@@ -177,12 +205,21 @@ contract HookMonolithTest is Test {
             0,
             true
         );
-        assertTokenDistribution(auctionToken, address(this), 100_000e18, address(poolManager), 900_000e18);
+        assertTokenDistribution(auctionToken, address(alice), 100_000e18, address(poolManager), 900_000e18);
     }
 
     function testAuctionWithInvertedTokenOrder() public {
-        (address token, PoolId poolId) = initializeAuctionHelper("Inverted Token", "INV", 500_000e18, 50_000e18, 1000, 0, true);
-        assertAuctionDetails(poolId, address(this), 50_000e18, 1000, token);
+        vm.prank(alice);
+        (address token, PoolId poolId) = initializeAuctionHelper(
+            "Inverted Token",
+            "INV",
+            500_000e18,
+            50_000e18,
+            1000,
+            0,
+            true
+        );
+        assertAuctionDetails(poolId, address(alice), 50_000e18, 1000, token);
     }
 
     function testSwapFeesPerPeriod() public {
